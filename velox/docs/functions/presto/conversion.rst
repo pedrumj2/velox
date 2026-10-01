@@ -1213,10 +1213,14 @@ From floating-point types
 
 Casting a floating-point number to a decimal of given precision and scale is allowed
 if the input value can be represented by the precision and scale. When the given
-scale is less than the number of decimal places, the floating-point value is rounded.
-The conversion precision is up to 15 for double and 6 for real according to the
-significant decimal digits precision they provide. Casting from NaN or infinite value
-throws.
+scale is less than the number of decimal places, the floating-point value is rounded
+half up. A double is rounded from the shortest decimal that converts back to the same
+double, taking the one closest to the double when several qualify. That decimal keeps
+up to 17 significant digits. A double whose magnitude is between 2^53 and 2^63 keeps
+its integer digits, except that the last digit is rounded off from 2^58 and the last
+two from 2^61. A real is first rounded to max(0, 7 - n) decimal places, where n is the
+number of digits in its integer part, or 0 when the integer part is 0. Casting from NaN
+or infinite value throws.
 
 Valid example
 
@@ -1226,6 +1230,7 @@ Valid example
   SELECT cast(0.12 as decimal(4, 1)); -- decimal '0.1'
   SELECT cast(0.19 as decimal(4, 1)); -- decimal '0.2'
   SELECT cast(0.123456789123123 as decimal(38, 18)); -- decimal '0.123456789123123000'
+  SELECT cast(0.825e0 / 3 as decimal(18, 2)); -- decimal '0.27'
   SELECT cast(real '0.123456' as decimal(38, 18)); -- decimal '0.123456000000000000'
 
 Invalid example

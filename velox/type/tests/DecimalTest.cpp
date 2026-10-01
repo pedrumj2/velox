@@ -448,8 +448,35 @@ TEST(DecimalTest, rescaleDouble) {
 
   assertRescaleDouble(-0.9999999999999999, DECIMAL(17, 2), -100);
 
+  // Rounds half up from the shortest decimal that converts back to the same
+  // double, taking the one closest to the double when several qualify.
+  // 0.825 / 3 is 0.27499999999999997.
+  assertRescaleDouble(0.825 / 3, DECIMAL(18, 2), 27);
+  assertRescaleDouble(-0.825 / 3, DECIMAL(18, 2), -27);
+
+  // All 17 significant digits are kept.
+  assertRescaleDouble(0.1 + 0.2, DECIMAL(38, 18), 300'000'000'000'000'040);
   assertRescaleDouble(
-      kMaxDoubleBelowInt64Max, DECIMAL(19, 0), 9'223'372'036'854'774'784);
+      1.2345678901234567e20,
+      DECIMAL(38, 2),
+      HugeInt::parse("12345678901234567" + zeros(6)));
+
+  // 1.9400994884341944e25 also converts back to this double, but
+  // 1.9400994884341945e25 is closer to it.
+  assertRescaleDouble(
+      1.9400994884341945e25,
+      DECIMAL(38, 0),
+      HugeInt::parse("19400994884341945" + zeros(9)));
+
+  // Integers between 2^53 and 2^63 keep the digits Java 8 to 18 print: all of
+  // them below 2^58, all but the last from 2^58, and all but the last two
+  // from 2^61.
+  assertRescaleDouble(
+      2.882303761517117e17, DECIMAL(20, 0), 288'230'376'151'711'712);
+  assertRescaleDouble(
+      2.9333178960638342e17, DECIMAL(20, 0), 293'331'789'606'383'420);
+  assertRescaleDouble(
+      kMaxDoubleBelowInt64Max, DECIMAL(19, 0), 9'223'372'036'854'774'800);
 
   // Test for overflows.
   std::vector<double> invalidInputs = {

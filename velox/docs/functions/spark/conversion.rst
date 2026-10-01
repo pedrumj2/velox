@@ -541,7 +541,11 @@ From floating-point types
 *(ANSI compliant)*
 
 Casting a floating-point value to a decimal of given precision and scale is
-allowed. Supported types are real and double.
+allowed. Supported types are real and double. A double is rounded half up from
+the shortest decimal that converts back to the same double, taking the one
+closest to the double when several qualify. A double whose magnitude is between
+2^53 and 2^63 keeps its integer digits, except that the last digit is rounded off
+from 2^58 and the last two from 2^61.
 
 When ANSI mode is enabled, casting a value that overflows the target precision
 and scale or is not finite throws an error. Otherwise, such casts return NULL.
@@ -561,6 +565,7 @@ Valid examples
 
   SELECT cast(cast(99999.99 as double) as decimal(10, 4)); -- 99999.9900
   SELECT cast(cast(-1.0 as double) as decimal(10, 4)); -- -1.0000
+  SELECT cast(cast(0.825 as double) / 3 as decimal(18, 2)); -- 0.27
   SELECT cast(cast(10.03 as real) as decimal(10, 4)); -- 10.0300
   SELECT cast(cast(0.0 as real) as decimal(10, 4)); -- 0.0000
 

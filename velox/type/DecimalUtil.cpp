@@ -15,6 +15,9 @@
  */
 
 #include "velox/type/DecimalUtil.h"
+
+#include <fmt/compile.h>
+
 #include "velox/type/HugeInt.h"
 
 namespace facebook::velox {
@@ -263,7 +266,97 @@ Status parseHugeInt(const DecimalComponents& decimalComponents, int128_t& out) {
   }
   return Status::OK();
 }
+
+// Returns {unscaled, exponent} such that the shortest decimal that converts
+// back to 'value', taking the one closest to 'value' when several qualify, is
+// unscaled * 10^exponent. 'value' must be finite and not negative.
+std::pair<int128_t, int32_t> shortestDecimal(double value) {
+  // fmt prints at most 23 characters, such as '1.7976931348623157e+308'.
+  char buffer[32];
+  const auto [end, size] =
+      fmt::format_to_n(buffer, sizeof(buffer), FMT_COMPILE("{}"), value);
+  VELOX_DCHECK_LE(size, sizeof(buffer));
+
+  DecimalComponents components;
+  auto status{parseDecimalComponents(buffer, end - buffer, components)};
+  VELOX_DCHECK(status.ok());
+  int128_t unscaled{0};
+  status = parseHugeInt(components, unscaled);
+  VELOX_DCHECK(status.ok());
+  return {
+      unscaled,
+      components.exponent.value_or(0) -
+          static_cast<int32_t>(components.fractionalDigits.size()),
+  };
+}
+
+// Returns the digits Java 8 to 18 print for an integer double in [2^53, 2^63).
+// Double.toString() rounds off, half up, the last digit from 2^58 and the last
+// two from 2^61.
+int128_t javaIntegerDigits(double magnitude) {
+  const int128_t exact{static_cast<int128_t>(magnitude)};
+  const int exponent{std::ilogb(magnitude)};
+  if (exponent < 58) {
+    return exact;
+  }
+  const int128_t step{exponent < 61 ? 10 : 100};
+  return (exact + step / 2) / step * step;
+}
 } // namespace
+
+template <typename TOutput>
+Status DecimalUtil::rescaleDouble(
+    double value,
+    int precision,
+    int scale,
+    TOutput& output) {
+  int128_t rescaledValue{0};
+  const double magnitude{std::abs(value)};
+  if (magnitude >= 0x1p53 && magnitude < 0x1p63) {
+    if (__builtin_mul_overflow(
+            javaIntegerDigits(magnitude),
+            kPowersOfTen[scale],
+            &rescaledValue)) {
+      return Status::UserError("Result overflows.");
+    }
+  } else {
+    const auto [unscaled, exponent] = shortestDecimal(magnitude);
+    const int32_t shift{exponent + scale};
+    if (shift >= 0) {
+      if (shift > LongDecimalType::kMaxPrecision ||
+          __builtin_mul_overflow(
+              unscaled, kPowersOfTen[shift], &rescaledValue)) {
+        return Status::UserError("Result overflows.");
+      }
+    } else if (-shift > ShortDecimalType::kMaxPrecision) {
+      // 'unscaled' has at most 17 digits, so the value rounds to zero.
+      rescaledValue = 0;
+    } else {
+      divideWithRoundUp<int128_t, int128_t, int128_t>(
+          rescaledValue, unscaled, kPowersOfTen[-shift], false, 0, 0);
+    }
+  }
+  if (value < 0) {
+    rescaledValue = -rescaledValue;
+  }
+
+  if constexpr (std::is_same_v<TOutput, int64_t>) {
+    if (rescaledValue > std::numeric_limits<int64_t>::max() ||
+        rescaledValue < std::numeric_limits<int64_t>::min()) {
+      return Status::UserError("Result overflows.");
+    }
+  }
+  if (!valueInPrecisionRange<int128_t>(rescaledValue, precision)) {
+    return Status::UserError(
+        "Result cannot fit in the given precision {}.", precision);
+  }
+  output = static_cast<TOutput>(rescaledValue);
+  return Status::OK();
+}
+
+template Status DecimalUtil::rescaleDouble<int64_t>(double, int, int, int64_t&);
+template Status
+DecimalUtil::rescaleDouble<int128_t>(double, int, int, int128_t&);
 
 Status DecimalUtil::parseStringToDecimalComponents(
     const StringView& s,

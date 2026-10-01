@@ -198,58 +198,50 @@ class DecimalUtil : public DecimalArithmetic {
       return Status::UserError("Result overflows.");
     }
 
-    uint8_t digits;
-    if constexpr (std::is_same_v<TInput, float>) {
-      // A float provides nearly 7 precise digits.
-      digits = 7;
+    if constexpr (std::is_same_v<TInput, double>) {
+      return rescaleDouble(value, precision, scale, output);
     } else {
-      // A double provides from 15 to 17 decimal digits, so at least 15 digits
-      // are precise.
-      digits = 15;
-    }
+      // A float provides nearly 7 precise digits.
+      const int32_t digits{7};
 
-    // Calculate the precise fractional digits.
-    const auto integralValue = static_cast<uint128_t>(std::abs(value));
-    const auto integralDigits =
-        integralValue == 0 ? 0 : countDigits(integralValue);
-    const auto fractionDigits = std::max(digits - integralDigits, 0);
+      // Calculate the precise fractional digits.
+      const auto integralValue = static_cast<uint128_t>(std::abs(value));
+      const auto integralDigits =
+          integralValue == 0 ? 0 : countDigits(integralValue);
+      const auto fractionDigits = std::max(digits - integralDigits, 0);
 
-    // Scales up the input value with all the precise fractional digits kept.
-    // Convert value as long double type because 1) double * int128_t returns
-    // int128_t and fractional digits are lost. 2) we could also convert the
-    // int128_t value as double to avoid 'double * int128_t', but double
-    // multiplication gives inaccurate result on large numbers. For example,
-    // -3333030000000000000 * 1e3 = -3333030000000000065536. No need to
-    // consider the result becoming infinite as DOUBLE_MAX * 10^38 <
-    // LONG_DOUBLE_MAX.
-    long double scaledValue = std::round(
-        (long double)value * DecimalUtil::kPowersOfTen[fractionDigits]);
-    const auto result = folly::tryTo<TOutput>(scaledValue);
-    if (result.hasError()) {
-      return Status::UserError("Result overflows.");
-    }
-    TOutput rescaledValue = result.value();
-    if (scale > fractionDigits) {
-      bool isOverflow = __builtin_mul_overflow(
-          rescaledValue,
-          DecimalUtil::kPowersOfTen[scale - fractionDigits],
-          &rescaledValue);
-      if (isOverflow) {
+      // Scales up the input value with all the precise fractional digits kept.
+      // The product is computed in long double, where a float times at most
+      // 10^7 is exact and finite.
+      long double scaledValue = std::round(
+          (long double)value * DecimalUtil::kPowersOfTen[fractionDigits]);
+      const auto result = folly::tryTo<TOutput>(scaledValue);
+      if (result.hasError()) {
         return Status::UserError("Result overflows.");
       }
-    } else {
-      const auto scalingFactor =
-          DecimalUtil::kPowersOfTen[fractionDigits - scale];
-      divideWithRoundUp<TOutput, TOutput, int128_t>(
-          rescaledValue, rescaledValue, scalingFactor, false, 0, 0);
-    }
+      TOutput rescaledValue = result.value();
+      if (scale > fractionDigits) {
+        bool isOverflow = __builtin_mul_overflow(
+            rescaledValue,
+            DecimalUtil::kPowersOfTen[scale - fractionDigits],
+            &rescaledValue);
+        if (isOverflow) {
+          return Status::UserError("Result overflows.");
+        }
+      } else {
+        const auto scalingFactor =
+            DecimalUtil::kPowersOfTen[fractionDigits - scale];
+        divideWithRoundUp<TOutput, TOutput, int128_t>(
+            rescaledValue, rescaledValue, scalingFactor, false, 0, 0);
+      }
 
-    if (!valueInPrecisionRange<TOutput>(rescaledValue, precision)) {
-      return Status::UserError(
-          "Result cannot fit in the given precision {}.", precision);
+      if (!valueInPrecisionRange<TOutput>(rescaledValue, precision)) {
+        return Status::UserError(
+            "Result cannot fit in the given precision {}.", precision);
+      }
+      output = rescaledValue;
+      return Status::OK();
     }
-    output = rescaledValue;
-    return Status::OK();
   }
 
   /// Returns the max required size to convert the decimal of this precision and
@@ -550,5 +542,15 @@ class DecimalUtil : public DecimalArithmetic {
       int32_t& parsedPrecision,
       int32_t& parsedScale,
       int128_t& out);
+
+  // Rescales a finite double whose magnitude fits in TOutput to a decimal of
+  // given precision and scale. Rounds half up from the shortest decimal that
+  // converts back to the same double, taking the one closest to the double when
+  // several qualify. Doubles whose magnitude is between 2^53 and 2^63 instead
+  // use the integer digits Java 8 to 18 print. Returns an error status if the
+  // result does not fit.
+  template <typename TOutput>
+  static Status
+  rescaleDouble(double value, int precision, int scale, TOutput& output);
 }; // DecimalUtil
 } // namespace facebook::velox
