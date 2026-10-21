@@ -207,15 +207,24 @@ class MapFunction : public exec::VectorFunction {
   }
 };
 
-// Decoded inputs and output buffers threaded through the per-row build loop of
-// map_from_arrays and transform_keys.
-struct MapFromArraysBuffers {
+// Decoded inputs of map_from_arrays and transform_keys. For each row, the
+// offset and size of 'keysArray' at 'decodedKeys->index(row)' locate the row's
+// keys in 'keyElements', and the offset and size of 'valuesArray' at
+// 'decodedValues->index(row)' locate its values in 'valueElements'.
+struct MapFromArraysInputs {
   const DecodedVector* decodedKeys;
   const DecodedVector* decodedValues;
   const ArrayVectorBase* keysArray;
   const ArrayVectorBase* valuesArray;
+  VectorPtr keyElements;
   const DecodedVector* decodedKeyElements;
+  VectorPtr valueElements;
   bool throwExceptionOnDuplicateMapKeys;
+};
+
+// Output buffers filled by the per-row build loop of map_from_arrays and
+// transform_keys.
+struct MapFromArraysBuffers {
   vector_size_t* rawOffsets;
   vector_size_t* rawSizes;
   vector_size_t* rawKeysIndices;
@@ -313,21 +322,22 @@ class KeyDeduplicator {
 vector_size_t buildMapEntries(
     const SelectivityVector& rows,
     exec::EvalCtx& context,
+    const MapFromArraysInputs& inputs,
     const MapFromArraysBuffers& buffers) {
   KeyDeduplicator keyDeduplicator{
-      *buffers.decodedKeyElements, buffers.throwExceptionOnDuplicateMapKeys};
+      *inputs.decodedKeyElements, inputs.throwExceptionOnDuplicateMapKeys};
   vector_size_t numEntries{0};
   context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
-    const auto keysIndex = buffers.decodedKeys->index(row);
-    const auto valuesIndex = buffers.decodedValues->index(row);
-    const auto numKeys = buffers.keysArray->sizeAt(keysIndex);
+    const auto keysIndex = inputs.decodedKeys->index(row);
+    const auto valuesIndex = inputs.decodedValues->index(row);
+    const auto numKeys = inputs.keysArray->sizeAt(keysIndex);
     VELOX_USER_CHECK_EQ(
         numKeys,
-        buffers.valuesArray->sizeAt(valuesIndex),
+        inputs.valuesArray->sizeAt(valuesIndex),
         "The key array and value array of MapData must have the same length.");
 
-    const auto keysOffset = buffers.keysArray->offsetAt(keysIndex);
-    const auto valuesOffset = buffers.valuesArray->offsetAt(valuesIndex);
+    const auto keysOffset = inputs.keysArray->offsetAt(keysIndex);
+    const auto valuesOffset = inputs.valuesArray->offsetAt(valuesIndex);
 
     // A row that throws below leaves 'numEntries' unchanged, so the slots it
     // partially filled are reused by the next row and its size stays zero.
@@ -358,10 +368,11 @@ vector_size_t buildMapEntries(
 vector_size_t buildMapEntriesForConstantKeys(
     const SelectivityVector& rows,
     exec::EvalCtx& context,
+    const MapFromArraysInputs& inputs,
     const MapFromArraysBuffers& buffers) {
-  const auto keysIndex = buffers.decodedKeys->index(rows.begin());
-  const auto numKeys = buffers.keysArray->sizeAt(keysIndex);
-  const auto keysOffset = buffers.keysArray->offsetAt(keysIndex);
+  const auto keysIndex = inputs.decodedKeys->index(rows.begin());
+  const auto numKeys = inputs.keysArray->sizeAt(keysIndex);
+  const auto keysOffset = inputs.keysArray->offsetAt(keysIndex);
 
   // Slot occupied by the key at each position of the constant array, and the
   // key element index occupying each slot.
@@ -369,7 +380,7 @@ vector_size_t buildMapEntriesForConstantKeys(
   std::vector<vector_size_t> slotKeyIndices(numKeys);
   vector_size_t numDistinctKeys{0};
   KeyDeduplicator keyDeduplicator{
-      *buffers.decodedKeyElements, buffers.throwExceptionOnDuplicateMapKeys};
+      *inputs.decodedKeyElements, inputs.throwExceptionOnDuplicateMapKeys};
   keyDeduplicator.startRow();
   try {
     for (vector_size_t i = 0; i < numKeys; ++i) {
@@ -391,13 +402,13 @@ vector_size_t buildMapEntriesForConstantKeys(
 
   vector_size_t numEntries{0};
   context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
-    const auto valuesIndex = buffers.decodedValues->index(row);
+    const auto valuesIndex = inputs.decodedValues->index(row);
     VELOX_USER_CHECK_EQ(
         numKeys,
-        buffers.valuesArray->sizeAt(valuesIndex),
+        inputs.valuesArray->sizeAt(valuesIndex),
         "The key array and value array of MapData must have the same length.");
 
-    const auto valuesOffset = buffers.valuesArray->offsetAt(valuesIndex);
+    const auto valuesOffset = inputs.valuesArray->offsetAt(valuesIndex);
     buffers.rawOffsets[row] = numEntries;
     buffers.rawSizes[row] = numDistinctKeys;
     for (vector_size_t slot = 0; slot < numDistinctKeys; ++slot) {
@@ -465,6 +476,77 @@ bool canTakeFastPath(
   return true;
 }
 
+// Builds the map for EXCEPTION, under which no row can shrink, so the map
+// reuses the offsets, sizes and elements of the inputs. Requires 'keysArray'
+// and 'valuesArray' to hold row i at index i, with equal offsets and sizes.
+// Deselects from 'rows' every row with a null or repeated key. 'size' is the
+// number of rows in the map.
+MapVectorPtr makeZeroCopyMap(
+    SelectivityVector& rows,
+    exec::EvalCtx& context,
+    const MapFromArraysInputs& inputs,
+    const TypePtr& outputType,
+    vector_size_t size) {
+  checkNullAndDuplicateKeys(
+      rows, context, *inputs.keysArray, *inputs.decodedKeyElements);
+  context.deselectErrors(rows);
+
+  return std::make_shared<MapVector>(
+      context.pool(),
+      outputType,
+      inputs.keysArray->nulls(),
+      size,
+      inputs.keysArray->offsets(),
+      inputs.keysArray->sizes(),
+      inputs.keyElements,
+      inputs.valueElements);
+}
+
+// Builds the map with new offsets, sizes and entry indices, so a row can drop
+// the repeated keys that LAST_WIN merges. Deselects from 'rows' every row that
+// fails. 'size' is the number of rows in the map.
+MapVectorPtr makeDeduplicatedMap(
+    SelectivityVector& rows,
+    exec::EvalCtx& context,
+    const MapFromArraysInputs& inputs,
+    const TypePtr& outputType,
+    vector_size_t size) {
+  // Deduplication can only shrink a row, so the total number of keys is an
+  // upper bound on the number of entries in the result.
+  vector_size_t maxNumEntries{0};
+  rows.applyToSelected([&](vector_size_t row) {
+    maxNumEntries += inputs.keysArray->sizeAt(inputs.decodedKeys->index(row));
+  });
+
+  auto* pool = context.pool();
+  BufferPtr offsets = allocateOffsets(size, pool);
+  BufferPtr sizes = allocateSizes(size, pool);
+  BufferPtr keysIndices = allocateIndices(maxNumEntries, pool);
+  BufferPtr valuesIndices = allocateIndices(maxNumEntries, pool);
+  const MapFromArraysBuffers buffers{
+      .rawOffsets = offsets->asMutable<vector_size_t>(),
+      .rawSizes = sizes->asMutable<vector_size_t>(),
+      .rawKeysIndices = keysIndices->asMutable<vector_size_t>(),
+      .rawValuesIndices = valuesIndices->asMutable<vector_size_t>(),
+  };
+  const auto numEntries = inputs.decodedKeys->isConstantMapping()
+      ? buildMapEntriesForConstantKeys(rows, context, inputs, buffers)
+      : buildMapEntries(rows, context, inputs, buffers);
+  context.deselectErrors(rows);
+
+  return std::make_shared<MapVector>(
+      pool,
+      outputType,
+      nullptr,
+      size,
+      std::move(offsets),
+      std::move(sizes),
+      BaseVector::wrapInDictionary(
+          nullptr, std::move(keysIndices), numEntries, inputs.keyElements),
+      BaseVector::wrapInDictionary(
+          nullptr, std::move(valuesIndices), numEntries, inputs.valueElements));
+}
+
 // Implements Spark's map_from_arrays(array(K), array(V)) -> map(K,V). Entries
 // are inserted in array order. A repeated key raises DUPLICATED_MAP_KEY, or
 // under LAST_WIN overwrites the value of its first occurrence in place, so the
@@ -498,80 +580,26 @@ class MapFromArraysFunction : public exec::VectorFunction {
     exec::LocalDecodedVector decodedKeyElements(
         context, *keysElements, keyElementRows);
 
-    // Under EXCEPTION no row can shrink, so the result can reference the input
-    // arrays instead of building entry indices.
-    if (throwExceptionOnDuplicateMapKeys_ && decodedKeys->isIdentityMapping() &&
-        decodedValues->isIdentityMapping() &&
-        canTakeFastPath(*keysArray, *valuesArray, rows)) {
-      exec::LocalSelectivityVector remainingRows(context, rows);
-      checkNullAndDuplicateKeys(
-          *remainingRows, context, *keysArray, *decodedKeyElements);
-      context.deselectErrors(*remainingRows);
-
-      auto mapVector = std::make_shared<MapVector>(
-          context.pool(),
-          outputType,
-          keysArray->nulls(),
-          rows.end(),
-          keysArray->offsets(),
-          keysArray->sizes(),
-          keysElements,
-          valuesArray->elements());
-      context.moveOrCopyResult(mapVector, *remainingRows, result);
-      return;
-    }
-
-    // Deduplication can only shrink a row, so the total number of keys is an
-    // upper bound on the number of entries in the result.
-    vector_size_t maxNumEntries{0};
-    rows.applyToSelected([&](vector_size_t row) {
-      maxNumEntries += keysArray->sizeAt(decodedKeys->index(row));
-    });
-
-    auto* pool = context.pool();
-    BufferPtr offsets = allocateOffsets(rows.end(), pool);
-    auto* rawOffsets = offsets->asMutable<vector_size_t>();
-    BufferPtr sizes = allocateSizes(rows.end(), pool);
-    auto* rawSizes = sizes->asMutable<vector_size_t>();
-    BufferPtr keysIndices = allocateIndices(maxNumEntries, pool);
-    auto* rawKeysIndices = keysIndices->asMutable<vector_size_t>();
-    BufferPtr valuesIndices = allocateIndices(maxNumEntries, pool);
-    auto* rawValuesIndices = valuesIndices->asMutable<vector_size_t>();
-
-    exec::LocalSelectivityVector remainingRows(context, rows);
-
-    const MapFromArraysBuffers buffers{
+    const MapFromArraysInputs inputs{
         .decodedKeys = decodedKeys,
         .decodedValues = decodedValues,
         .keysArray = keysArray,
         .valuesArray = valuesArray,
+        .keyElements = keysElements,
         .decodedKeyElements = decodedKeyElements.get(),
+        .valueElements = valuesArray->elements(),
         .throwExceptionOnDuplicateMapKeys = throwExceptionOnDuplicateMapKeys_,
-        .rawOffsets = rawOffsets,
-        .rawSizes = rawSizes,
-        .rawKeysIndices = rawKeysIndices,
-        .rawValuesIndices = rawValuesIndices,
     };
-    const auto numEntries = decodedKeys->isConstantMapping()
-        ? buildMapEntriesForConstantKeys(*remainingRows, context, buffers)
-        : buildMapEntries(*remainingRows, context, buffers);
-
-    context.deselectErrors(*remainingRows);
-
-    auto mapVector = std::make_shared<MapVector>(
-        context.pool(),
-        outputType,
-        nullptr,
-        rows.end(),
-        std::move(offsets),
-        std::move(sizes),
-        BaseVector::wrapInDictionary(
-            nullptr, std::move(keysIndices), numEntries, keysElements),
-        BaseVector::wrapInDictionary(
-            nullptr,
-            std::move(valuesIndices),
-            numEntries,
-            valuesArray->elements()));
+    const bool canReuseInputArrays = throwExceptionOnDuplicateMapKeys_ &&
+        decodedKeys->isIdentityMapping() &&
+        decodedValues->isIdentityMapping() &&
+        canTakeFastPath(*keysArray, *valuesArray, rows);
+    exec::LocalSelectivityVector remainingRows(context, rows);
+    auto mapVector = canReuseInputArrays
+        ? makeZeroCopyMap(
+              *remainingRows, context, inputs, outputType, rows.end())
+        : makeDeduplicatedMap(
+              *remainingRows, context, inputs, outputType, rows.end());
     context.moveOrCopyResult(mapVector, *remainingRows, result);
   }
 
@@ -654,70 +682,25 @@ class TransformKeysFunction : public exec::VectorFunction {
         *transformedKeys,
         toElementRows<MapVector>(numKeys, *remainingRows, flatMap.get()));
 
-    // Under EXCEPTION no row can shrink, so the result keeps the offsets and
-    // sizes of the input map.
-    if (throwExceptionOnDuplicateMapKeys_) {
-      checkNullAndDuplicateKeys(
-          *remainingRows, context, *flatMap, *decodedKeys);
-      context.deselectErrors(*remainingRows);
-
-      auto mapVector = std::make_shared<MapVector>(
-          context.pool(),
-          outputType,
-          addNullsForUnselectedRows(flatMap, *remainingRows),
-          rows.end(),
-          flatMap->offsets(),
-          flatMap->sizes(),
-          transformedKeys,
-          flatMap->mapValues());
-      context.moveOrCopyResult(mapVector, rows, result);
-      return;
-    }
-
-    // Deduplication can only shrink a row, so the number of keys is an upper
-    // bound on the number of entries in the result.
-    vector_size_t maxNumEntries{0};
-    remainingRows->applyToSelected(
-        [&](vector_size_t row) { maxNumEntries += flatMap->sizeAt(row); });
-
-    auto* pool = context.pool();
-    BufferPtr offsets = allocateOffsets(rows.end(), pool);
-    BufferPtr sizes = allocateSizes(rows.end(), pool);
-    BufferPtr keysIndices = allocateIndices(maxNumEntries, pool);
-    BufferPtr valuesIndices = allocateIndices(maxNumEntries, pool);
-
     // The offsets and sizes of the map locate both the transformed keys and the
     // values.
     exec::LocalDecodedVector decodedFlatMap(context, *flatMap, *remainingRows);
-    const MapFromArraysBuffers buffers{
+    const MapFromArraysInputs inputs{
         .decodedKeys = decodedFlatMap.get(),
         .decodedValues = decodedFlatMap.get(),
         .keysArray = flatMap.get(),
         .valuesArray = flatMap.get(),
+        .keyElements = transformedKeys,
         .decodedKeyElements = decodedKeys.get(),
-        .throwExceptionOnDuplicateMapKeys = false,
-        .rawOffsets = offsets->asMutable<vector_size_t>(),
-        .rawSizes = sizes->asMutable<vector_size_t>(),
-        .rawKeysIndices = keysIndices->asMutable<vector_size_t>(),
-        .rawValuesIndices = valuesIndices->asMutable<vector_size_t>(),
+        .valueElements = flatMap->mapValues(),
+        .throwExceptionOnDuplicateMapKeys = throwExceptionOnDuplicateMapKeys_,
     };
-    const auto numEntries = buildMapEntries(*remainingRows, context, buffers);
-    context.deselectErrors(*remainingRows);
-
-    auto mapVector = std::make_shared<MapVector>(
-        pool,
-        outputType,
-        addNullsForUnselectedRows(flatMap, *remainingRows),
-        rows.end(),
-        std::move(offsets),
-        std::move(sizes),
-        BaseVector::wrapInDictionary(
-            nullptr, std::move(keysIndices), numEntries, transformedKeys),
-        BaseVector::wrapInDictionary(
-            nullptr,
-            std::move(valuesIndices),
-            numEntries,
-            flatMap->mapValues()));
+    auto mapVector = throwExceptionOnDuplicateMapKeys_
+        ? makeZeroCopyMap(
+              *remainingRows, context, inputs, outputType, rows.end())
+        : makeDeduplicatedMap(
+              *remainingRows, context, inputs, outputType, rows.end());
+    mapVector->setNulls(addNullsForUnselectedRows(flatMap, *remainingRows));
     context.moveOrCopyResult(mapVector, rows, result);
   }
 
