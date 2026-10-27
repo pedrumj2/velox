@@ -212,6 +212,31 @@ void checkNullAndDuplicateKeys(
   });
 }
 
+// Builds a map for the selected rows that reuses the offsets and sizes of
+// 'keysArray', which must also locate the values in 'valueElements'. A null or
+// repeated key fails its row, so no row shrinks and no entry indices are
+// needed. The result has the given size and the nulls of 'keysArray'.
+std::shared_ptr<MapVector> buildZeroCopyMap(
+    const SelectivityVector& rows,
+    exec::EvalCtx& context,
+    vector_size_t size,
+    const TypePtr& outputType,
+    const ArrayVectorBase& keysArray,
+    const DecodedVector& decodedKeyElements,
+    const VectorPtr& keyElements,
+    const VectorPtr& valueElements) {
+  checkNullAndDuplicateKeys(rows, context, keysArray, decodedKeyElements);
+  return std::make_shared<MapVector>(
+      context.pool(),
+      outputType,
+      keysArray.nulls(),
+      size,
+      keysArray.offsets(),
+      keysArray.sizes(),
+      keyElements,
+      valueElements);
+}
+
 // Can only take the fast path if keys and values have an equal number of arrays
 // and the offsets and sizes of these arrays match 1:1. The map must be well
 // formed for all elements, also ones not in 'rows' in apply(). This is because
@@ -277,39 +302,32 @@ class MapFromArraysFunction : public exec::VectorFunction {
 
     // Under EXCEPTION no row can shrink, so the result can reference the input
     // arrays instead of building entry indices.
-    if (throwExceptionOnDuplicateMapKeys_ && decodedKeys->isIdentityMapping() &&
+    const bool canReuseInputArrays{
+        throwExceptionOnDuplicateMapKeys_ && decodedKeys->isIdentityMapping() &&
         decodedValues->isIdentityMapping() &&
-        canTakeFastPath(*keysArray, *valuesArray, rows)) {
-      exec::LocalSelectivityVector remainingRows(context, rows);
-      checkNullAndDuplicateKeys(
-          *remainingRows, context, *keysArray, *decodedKeyElements);
-      context.deselectErrors(*remainingRows);
-
-      auto mapVector = std::make_shared<MapVector>(
-          context.pool(),
-          outputType,
-          keysArray->nulls(),
-          rows.end(),
-          keysArray->offsets(),
-          keysArray->sizes(),
-          keysElements,
-          valuesArray->elements());
-      context.moveOrCopyResult(mapVector, *remainingRows, result);
-      return;
-    }
-
+        canTakeFastPath(*keysArray, *valuesArray, rows)};
     exec::LocalSelectivityVector remainingRows(context, rows);
-    auto mapVector = buildDeduplicatedMap(
-        *remainingRows,
-        context,
-        rows.end(),
-        outputType,
-        *decodedKeys,
-        *decodedValues,
-        *decodedKeyElements,
-        keysElements,
-        valuesArray->elements(),
-        throwExceptionOnDuplicateMapKeys_);
+    auto mapVector = canReuseInputArrays
+        ? buildZeroCopyMap(
+              *remainingRows,
+              context,
+              rows.end(),
+              outputType,
+              *keysArray,
+              *decodedKeyElements,
+              keysElements,
+              valuesArray->elements())
+        : buildDeduplicatedMap(
+              *remainingRows,
+              context,
+              rows.end(),
+              outputType,
+              *decodedKeys,
+              *decodedValues,
+              *decodedKeyElements,
+              keysElements,
+              valuesArray->elements(),
+              throwExceptionOnDuplicateMapKeys_);
     context.deselectErrors(*remainingRows);
     context.moveOrCopyResult(mapVector, *remainingRows, result);
   }
@@ -552,40 +570,32 @@ class TransformKeysFunction : public exec::VectorFunction {
         *transformedKeys,
         toElementRows<MapVector>(numKeys, *remainingRows, flatMap.get()));
 
-    // Under EXCEPTION no row can shrink, so the result keeps the offsets and
-    // sizes of the input map.
-    if (throwExceptionOnDuplicateMapKeys_) {
-      checkNullAndDuplicateKeys(
-          *remainingRows, context, *flatMap, *decodedKeys);
-      context.deselectErrors(*remainingRows);
-
-      auto mapVector = std::make_shared<MapVector>(
-          context.pool(),
-          outputType,
-          addNullsForUnselectedRows(flatMap, *remainingRows),
-          rows.end(),
-          flatMap->offsets(),
-          flatMap->sizes(),
-          transformedKeys,
-          flatMap->mapValues());
-      context.moveOrCopyResult(mapVector, rows, result);
-      return;
-    }
-
     // The offsets and sizes of the map locate both the transformed keys and the
     // values.
     exec::LocalDecodedVector decodedFlatMap(context, *flatMap, *remainingRows);
-    auto mapVector = buildDeduplicatedMap(
-        *remainingRows,
-        context,
-        rows.end(),
-        outputType,
-        *decodedFlatMap,
-        *decodedFlatMap,
-        *decodedKeys,
-        transformedKeys,
-        flatMap->mapValues(),
-        /*throwOnDuplicateKey=*/false);
+    // Under EXCEPTION no row can shrink, so the result keeps the offsets and
+    // sizes of the input map.
+    auto mapVector = throwExceptionOnDuplicateMapKeys_
+        ? buildZeroCopyMap(
+              *remainingRows,
+              context,
+              rows.end(),
+              outputType,
+              *flatMap,
+              *decodedKeys,
+              transformedKeys,
+              flatMap->mapValues())
+        : buildDeduplicatedMap(
+              *remainingRows,
+              context,
+              rows.end(),
+              outputType,
+              *decodedFlatMap,
+              *decodedFlatMap,
+              *decodedKeys,
+              transformedKeys,
+              flatMap->mapValues(),
+              /*throwOnDuplicateKey=*/false);
     context.deselectErrors(*remainingRows);
     mapVector->setNulls(addNullsForUnselectedRows(flatMap, *remainingRows));
     context.moveOrCopyResult(mapVector, rows, result);
